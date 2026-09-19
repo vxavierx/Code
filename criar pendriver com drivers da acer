@@ -1,0 +1,2104 @@
+#requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Cria uma mídia Windows 11 personalizada para o Acer TravelMate P2 TMP214-55
+    a partir de um pendrive já criado pelo MediaCreationTool.
+
+.DESCRIPTION
+    Fluxo:
+      1. Detecta o pendrive do Windows 11 já criado pelo MediaCreationTool.
+      2. Baixa o pacote SCCM oficial Acer para TMP214-55 / Windows 11 25H2.
+      3. Valida o arquivo CAB.
+      4. Extrai o pacote SCCM CAB para obter todos os drivers.
+      5. Localiza todos os arquivos .INF.
+      6. Copia/converte install.esd/install.wim ou reconstrói install*.swm para um WIM de trabalho local.
+         A enumeração SWM usa Get-WimInfo no primeiro .swm; a exportação usa o padrão install*.swm.
+      7. Injeta drivers de storage/rede no boot.wim.
+      8. Injeta todos os drivers Acer na edição Windows 11 Pro
+         (ou em todas as edições, se configurado).
+      9. Divide install.wim em install.swm/install2.swm/... para FAT32.
+     10. Faz backup local das imagens originais.
+     11. Atualiza o pendrive somente depois de todas as etapas locais terminarem.
+     12. Opcionalmente copia os drivers extraídos para \AcerDrivers no pendrive.
+
+    IMPORTANTE:
+      - NÃO formata o pendrive.
+      - NÃO atualiza BIOS/firmware.
+      - NÃO injeta drivers não assinados com ForceUnsigned.
+      - Execute em Windows PowerShell 5.1 ou PowerShell com o módulo DISM disponível.
+#>
+
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# =============================================================================
+# CONFIGURAÇÃO DO NOTEBOOK
+# =============================================================================
+
+$AcerModel      = 'TMP214-55'
+$AcerPartNumber = '002'
+$AcerSerial     = 'NXB'
+
+# Deixe vazio para detectar automaticamente o pendrive do MediaCreationTool.
+# Para forçar uma letra, use por exemplo: $UsbDriveLetter = 'E'
+$UsbDriveLetter = ''
+
+# Por padrão, injeta todos os drivers apenas no Windows 11 Pro.
+# Se a edição não for encontrada, o script usa todas as edições.
+$PreferredEdition = 'Windows 11 Pro'
+
+# $false = apenas PreferredEdition
+# $true  = todas as edições existentes na mídia
+$InjectIntoAllEditions = $false
+
+# Copia uma pasta \AcerDrivers para o pendrive ao final se houver espaço.
+$CopyDriversToUSB = $true
+
+# Diretório de trabalho local. Use NTFS e mantenha pelo menos ~25 GB livres.
+$WorkRoot = 'C:\AcerWin11Builder'
+
+# Tamanho máximo, em MB, de cada arquivo SWM.
+# 3800 fica com folga abaixo do limite de 4 GB do FAT32.
+$SplitSizeMB = 3800
+
+# =============================================================================
+# DIRETÓRIOS
+# =============================================================================
+
+$DownloadRoot = Join-Path $WorkRoot 'Downloads'
+$DriverRoot   = Join-Path $WorkRoot 'Drivers'
+$ImageRoot    = Join-Path $WorkRoot 'Images'
+$MountRoot    = Join-Path $WorkRoot 'Mount'
+$MountInstall = Join-Path $MountRoot 'Install'
+$MountBoot    = Join-Path $MountRoot 'Boot'
+$OutputRoot   = Join-Path $WorkRoot 'Output'
+
+$RunStamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
+$BackupRoot = Join-Path $WorkRoot ("Backup\" + $RunStamp)
+$LogRoot    = Join-Path $WorkRoot ("Logs\" + $RunStamp)
+
+$AcerApiUri = 'https://global-download.acer.com/api/wsgdp.asmx/SNModel2DriverList'
+# Pacote SCCM oficial Acer listado para TMP214-55 / Windows 11 25H2.
+# Fonte Acer:
+# https://community.acer.com/en/kb/articles/15378-microsoft-system-center-configuration-manager-sccm
+$AcerSccmPackUrl = 'https://global-download.acer.com/supportfiles/files/support/sccm/Z8W_25H2_260203_Windows11_All.cab'
+$AcerSccmPackName = 'TMP214-55_W11_25H2_Z8W_260203_All.cab'
+$AcerSccmPackPath = Join-Path $DownloadRoot $AcerSccmPackName
+
+# Tamanho observado do arquivo oficial atual. Usado como validação forte quando
+# o servidor não devolve Content-Length via HEAD.
+$AcerSccmPackExpectedBytes = 1838471828
+
+
+$script:TranscriptStarted = $false
+$script:UsbUpdateStarted  = $false
+$script:UsbRoot           = $null
+$script:UsbSources        = $null
+$script:OriginalInstallType = $null
+$script:OriginalInstallPath = $null
+
+$script:OriginalInstallFiles = @()
+
+# =============================================================================
+# FUNÇÕES GERAIS
+# =============================================================================
+
+function Write-Step {
+    param([Parameter(Mandatory)][string]$Message)
+
+    Write-Host ''
+    Write-Host ('=' * 76) -ForegroundColor DarkCyan
+    Write-Host $Message -ForegroundColor Cyan
+    Write-Host ('=' * 76) -ForegroundColor DarkCyan
+}
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Test-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Execute o PowerShell como Administrador.'
+    }
+}
+
+function Get-MountedImageDirectory {
+    param([Parameter(Mandatory)]$MountedImage)
+
+    foreach ($propName in @('Path', 'MountPath', 'MountDirectory')) {
+        $prop = $MountedImage.PSObject.Properties[$propName]
+        if ($prop -and $prop.Value) {
+            return [string]$prop.Value
+        }
+    }
+
+    return $null
+}
+
+function Remove-OurMountedImages {
+    Write-Step 'VERIFICANDO MONTAGENS DISM ANTIGAS'
+
+    $mountedImages = @()
+
+    try {
+        $mountedImages = @(Get-WindowsImage -Mounted -ErrorAction Stop)
+    }
+    catch {
+        Write-Warning "Não foi possível consultar montagens DISM: $($_.Exception.Message)"
+    }
+
+    $workPrefix = $WorkRoot.TrimEnd('\')
+
+    foreach ($mountedImage in $mountedImages) {
+        $mountPath = Get-MountedImageDirectory -MountedImage $mountedImage
+
+        if (-not $mountPath) {
+            continue
+        }
+
+        $normalized = $mountPath.TrimEnd('\')
+
+        if ($normalized.StartsWith($workPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "Montagem anterior encontrada: $mountPath" -ForegroundColor Yellow
+
+            if (Test-Path -LiteralPath $mountPath) {
+                try {
+                    Dismount-WindowsImage `
+                        -Path $mountPath `
+                        -Discard `
+                        -ErrorAction Stop | Out-Null
+
+                    Write-Host 'Montagem descartada.' -ForegroundColor Green
+                }
+                catch {
+                    Write-Warning "Não foi possível desmontar $mountPath : $($_.Exception.Message)"
+                }
+            }
+            else {
+                Write-Warning "O DISM registra a montagem, mas a pasta não existe: $mountPath"
+            }
+        }
+    }
+
+    # Limpa registros de pontos de montagem DISM corrompidos, se houver.
+    if (Get-Command Clear-WindowsCorruptMountPoint -ErrorAction SilentlyContinue) {
+        try {
+            Clear-WindowsCorruptMountPoint -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Write-Warning "Clear-WindowsCorruptMountPoint retornou: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Host 'Verificação de montagens concluída.' -ForegroundColor Green
+}
+
+function Reset-RunDirectories {
+    Write-Step 'PREPARANDO DIRETÓRIO DE TRABALHO'
+
+    # Mantém Downloads e Backups de execuções anteriores.
+    foreach ($path in @($DriverRoot, $ImageRoot, $MountRoot, $OutputRoot)) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+        }
+    }
+
+    foreach ($path in @(
+        $WorkRoot,
+        $DownloadRoot,
+        $DriverRoot,
+        $ImageRoot,
+        $MountRoot,
+        $MountInstall,
+        $MountBoot,
+        $OutputRoot,
+        $BackupRoot,
+        $LogRoot
+    )) {
+        Ensure-Directory -Path $path
+    }
+}
+
+function Get-FreeSpaceGB {
+    param([Parameter(Mandatory)][string]$DriveLetter)
+
+    $driveName = $DriveLetter.TrimEnd(':').TrimEnd('\')
+    $drive = Get-PSDrive -Name $driveName -ErrorAction Stop
+    return [math]::Round($drive.Free / 1GB, 2)
+}
+
+function Set-FileWritable {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        try {
+            $item = Get-Item -LiteralPath $Path -Force
+            if ($item.IsReadOnly) {
+                $item.IsReadOnly = $false
+            }
+        }
+        catch {
+            & attrib.exe -R $Path 2>$null | Out-Null
+        }
+    }
+}
+
+# =============================================================================
+# DETECÇÃO DO PENDRIVE
+# =============================================================================
+
+function Find-WindowsUSB {
+    Write-Step 'LOCALIZANDO O PENDRIVE DO WINDOWS 11'
+
+    if ($UsbDriveLetter) {
+        $root = "$($UsbDriveLetter.TrimEnd(':')):"
+
+        if (-not (Test-Path -LiteralPath (Join-Path $root 'setup.exe'))) {
+            throw "Não encontrei setup.exe em $root"
+        }
+
+        if (-not (Test-Path -LiteralPath (Join-Path $root 'sources\boot.wim'))) {
+            throw "Não encontrei sources\boot.wim em $root"
+        }
+
+        $forcedHasInstallImage =
+            (Test-Path -LiteralPath (Join-Path $root 'sources\install.wim')) -or
+            (Test-Path -LiteralPath (Join-Path $root 'sources\install.esd')) -or
+            (Test-Path -LiteralPath (Join-Path $root 'sources\install.swm'))
+
+        if (-not $forcedHasInstallImage) {
+            throw "Não encontrei install.wim, install.esd ou install.swm em $root\sources"
+        }
+
+        return $root
+    }
+
+    $candidates = @()
+
+    foreach ($volume in @(Get-Volume | Where-Object { $_.DriveLetter })) {
+        $root = "$($volume.DriveLetter):"
+
+        $setup = Join-Path $root 'setup.exe'
+        $boot  = Join-Path $root 'sources\boot.wim'
+        $esd   = Join-Path $root 'sources\install.esd'
+        $wim   = Join-Path $root 'sources\install.wim'
+        $swm   = Join-Path $root 'sources\install.swm'
+
+        if ((Test-Path -LiteralPath $setup) -and
+            (Test-Path -LiteralPath $boot) -and
+            ((Test-Path -LiteralPath $esd) -or
+             (Test-Path -LiteralPath $wim) -or
+             (Test-Path -LiteralPath $swm))) {
+
+            $candidates += [PSCustomObject]@{
+                Root       = $root
+                Drive      = $volume.DriveLetter
+                Label      = $volume.FileSystemLabel
+                FileSystem = $volume.FileSystem
+                SizeGB     = [math]::Round($volume.Size / 1GB, 2)
+            }
+        }
+    }
+
+    if ($candidates.Count -eq 0) {
+        throw @"
+Não encontrei automaticamente uma mídia válida do Windows 11.
+
+O detector aceita:
+  sources\install.wim
+  sources\install.esd
+  sources\install.swm
+
+Conecte o pendrive e execute novamente.
+
+Se necessário, force a letra no início do script:
+`$UsbDriveLetter = 'E'
+"@
+    }
+
+    if ($candidates.Count -gt 1) {
+        Write-Host 'Foram encontradas várias mídias compatíveis:' -ForegroundColor Yellow
+        $candidates | Format-Table Root, Label, FileSystem, SizeGB -AutoSize | Out-Host
+    }
+
+    # Prioridade para rótulos normalmente usados pela mídia da Microsoft.
+    $selected = $candidates |
+        Sort-Object @{
+            Expression = {
+                if ($_.Label -match 'ESD|WINDOWS|WIN11|CCCOMA') { 0 } else { 1 }
+            }
+        }, Drive |
+        Select-Object -First 1
+
+    Write-Host ''
+    Write-Host 'Pendrive selecionado:' -ForegroundColor Green
+    $selected | Format-List
+
+    return $selected.Root
+}
+
+# =============================================================================
+# ACER - PACOTE SCCM OFICIAL
+# =============================================================================
+
+function Get-RemoteContentLength {
+    param([Parameter(Mandatory)][string]$Url)
+
+    try {
+        $head = Invoke-WebRequest `
+            -Uri $Url `
+            -Method Head `
+            -UseBasicParsing `
+            -Headers @{ 'User-Agent' = 'Mozilla/5.0' } `
+            -TimeoutSec 60 `
+            -ErrorAction Stop
+
+        $value = $head.Headers['Content-Length']
+
+        if ($value) {
+            return [int64]$value
+        }
+    }
+    catch {
+        Write-Host 'HEAD não retornou Content-Length; usarei a validação local do CAB.' `
+            -ForegroundColor DarkGray
+    }
+
+    return [int64]0
+}
+
+
+function Test-CabinetFile {
+    param([Parameter(Mandatory)][string]$CabPath)
+
+    if (-not (Test-Path -LiteralPath $CabPath)) {
+        return $false
+    }
+
+    $item = Get-Item -LiteralPath $CabPath
+
+    if ($item.Length -lt 100MB) {
+        return $false
+    }
+
+    $listLog = Join-Path $LogRoot 'Acer-SCCM-CAB-List.txt'
+
+    try {
+        $output = @(
+            & "$env:SystemRoot\System32\expand.exe" `
+                -D `
+                $CabPath 2>&1
+        )
+
+        $exitCode = $LASTEXITCODE
+
+        $output |
+            Set-Content `
+                -LiteralPath $listLog `
+                -Encoding UTF8
+
+        return ($exitCode -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+
+function Download-AcerSccmPack {
+    Write-Step 'BAIXANDO PACOTE SCCM OFICIAL DA ACER'
+
+    Write-Host "Modelo      : $AcerModel"
+    Write-Host "P/N         : $AcerPartNumber"
+    Write-Host "Pacote      : TMP214-55_W11_25H2"
+    Write-Host "Destino     : $AcerSccmPackPath"
+    Write-Host ''
+    Write-Host 'O pacote tem aproximadamente 1,84 GB.' -ForegroundColor Yellow
+
+    Ensure-Directory -Path $DownloadRoot
+
+    $remoteLength = Get-RemoteContentLength -Url $AcerSccmPackUrl
+
+    if ($remoteLength -gt 0) {
+        Write-Host "Tamanho informado pelo servidor: $([math]::Round($remoteLength / 1GB, 2)) GB"
+    }
+
+    if (Test-Path -LiteralPath $AcerSccmPackPath) {
+        $existing = Get-Item -LiteralPath $AcerSccmPackPath
+
+        $sizeMatches = $true
+
+        if ($remoteLength -gt 0) {
+            $sizeMatches = ($existing.Length -eq $remoteLength)
+        }
+        elseif ($AcerSccmPackExpectedBytes -gt 0) {
+            $sizeMatches = ($existing.Length -eq $AcerSccmPackExpectedBytes)
+        }
+
+        if ($sizeMatches -and (Test-CabinetFile -CabPath $AcerSccmPackPath)) {
+            Write-Host 'Pacote SCCM já existe no cache e passou na validação. Reutilizando.' `
+                -ForegroundColor Green
+
+            return Get-Item -LiteralPath $AcerSccmPackPath
+        }
+
+        Write-Warning 'O CAB existente parece incompleto ou inválido. Ele será baixado novamente.'
+
+        Remove-Item `
+            -LiteralPath $AcerSccmPackPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+
+    $downloaded = $false
+
+    # 1) BITS: melhor para arquivo grande e mais resistente a oscilações.
+    if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+        try {
+            Write-Host 'Método de download: BITS' -ForegroundColor Cyan
+
+            Start-BitsTransfer `
+                -Source $AcerSccmPackUrl `
+                -Destination $AcerSccmPackPath `
+                -DisplayName 'Acer TMP214-55 Windows 11 25H2 SCCM Drivers' `
+                -Description 'Download do pacote oficial de drivers Acer' `
+                -ErrorAction Stop
+
+            $downloaded = $true
+        }
+        catch {
+            Write-Warning "BITS falhou: $($_.Exception.Message)"
+        }
+    }
+
+    # 2) curl.exe: presente nas versões modernas do Windows.
+    if (-not $downloaded -and (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        try {
+            Write-Host 'Método de download: curl.exe' -ForegroundColor Cyan
+
+            & curl.exe `
+                -L `
+                --fail `
+                --retry 5 `
+                --retry-delay 5 `
+                --connect-timeout 60 `
+                -o $AcerSccmPackPath `
+                $AcerSccmPackUrl
+
+            if ($LASTEXITCODE -ne 0) {
+                throw "curl.exe retornou código $LASTEXITCODE."
+            }
+
+            $downloaded = $true
+        }
+        catch {
+            Write-Warning "curl.exe falhou: $($_.Exception.Message)"
+        }
+    }
+
+    # 3) Último fallback: Invoke-WebRequest.
+    if (-not $downloaded) {
+        try {
+            Write-Host 'Método de download: Invoke-WebRequest' -ForegroundColor Cyan
+
+            Invoke-WebRequest `
+                -Uri $AcerSccmPackUrl `
+                -OutFile $AcerSccmPackPath `
+                -UseBasicParsing `
+                -Headers @{ 'User-Agent' = 'Mozilla/5.0' } `
+                -TimeoutSec 7200 `
+                -ErrorAction Stop
+
+            $downloaded = $true
+        }
+        catch {
+            throw "Falha ao baixar o pacote SCCM Acer: $($_.Exception.Message)"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $AcerSccmPackPath)) {
+        throw 'O download terminou sem criar o arquivo CAB.'
+    }
+
+    $cab = Get-Item -LiteralPath $AcerSccmPackPath
+
+    Write-Host ''
+    Write-Host "Arquivo baixado: $([math]::Round($cab.Length / 1GB, 2)) GB" `
+        -ForegroundColor Green
+
+    if ($remoteLength -gt 0 -and $cab.Length -ne $remoteLength) {
+        throw @"
+O tamanho baixado não corresponde ao Content-Length informado pelo servidor.
+
+Esperado : $remoteLength bytes
+Obtido   : $($cab.Length) bytes
+
+O arquivo foi mantido em:
+$AcerSccmPackPath
+"@
+    }
+
+    if (-not (Test-CabinetFile -CabPath $AcerSccmPackPath)) {
+        throw @"
+O arquivo foi baixado, mas o Windows não conseguiu listar o conteúdo do CAB.
+
+Arquivo:
+$AcerSccmPackPath
+
+Consulte:
+$(Join-Path $LogRoot 'Acer-SCCM-CAB-List.txt')
+"@
+    }
+
+    Write-Host 'CAB oficial Acer validado com sucesso.' -ForegroundColor Green
+
+    return $cab
+}
+
+
+function Expand-AcerSccmPack {
+    param([Parameter(Mandatory)][string]$CabPath)
+
+    Write-Step 'EXTRAINDO PACOTE SCCM DE DRIVERS'
+
+    if (Test-Path -LiteralPath $DriverRoot) {
+        Remove-Item `
+            -LiteralPath $DriverRoot `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop
+    }
+
+    Ensure-Directory -Path $DriverRoot
+
+    $expandLog = Join-Path $LogRoot 'Acer-SCCM-Expand.log'
+
+    Write-Host 'Extraindo todos os arquivos do CAB...' -ForegroundColor Yellow
+    Write-Host "Origem : $CabPath"
+    Write-Host "Destino: $DriverRoot"
+
+    $output = @(
+        & "$env:SystemRoot\System32\expand.exe" `
+            -F:* `
+            $CabPath `
+            $DriverRoot 2>&1
+    )
+
+    $exitCode = $LASTEXITCODE
+
+    $output |
+        Set-Content `
+            -LiteralPath $expandLog `
+            -Encoding UTF8
+
+    if ($exitCode -ne 0) {
+        throw @"
+expand.exe falhou ao extrair o pacote SCCM Acer.
+
+Código: $exitCode
+Log   : $expandLog
+"@
+    }
+
+    $infFiles = @(
+        Get-ChildItem `
+            -LiteralPath $DriverRoot `
+            -Filter '*.inf' `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue
+    )
+
+    if ($infFiles.Count -eq 0) {
+        throw @"
+O CAB foi extraído, mas nenhum arquivo .INF foi encontrado.
+
+Destino:
+$DriverRoot
+
+Log:
+$expandLog
+"@
+    }
+
+    $totalBytes = [int64]((
+        Get-ChildItem `
+            -LiteralPath $DriverRoot `
+            -File `
+            -Recurse |
+        Measure-Object Length -Sum
+    ).Sum)
+
+    Write-Host ''
+    Write-Host "INF encontrados : $($infFiles.Count)" -ForegroundColor Green
+    Write-Host "Extraído         : $([math]::Round($totalBytes / 1GB, 2)) GB" `
+        -ForegroundColor Green
+}
+
+# =============================================================================
+# ACER - API E DOWNLOADS
+# =============================================================================
+
+function Invoke-AcerDriverApi {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$OS,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SiteID,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Language,
+        [Parameter(Mandatory)][int]$AttemptNumber
+    )
+
+    $body = @{
+        Brand        = 'Acer'
+        SerialNumber = $AcerSerial
+        BiosModel    = $AcerModel
+        OS           = $OS
+        SiteID       = $SiteID
+        Language     = $Language
+    }
+
+    Write-Host "Tentativa $AttemptNumber - OS='$OS' SiteID='$SiteID' Language='$Language'" `
+        -ForegroundColor DarkGray
+
+    $response = Invoke-WebRequest `
+        -Uri $AcerApiUri `
+        -Method Post `
+        -ContentType 'application/x-www-form-urlencoded' `
+        -Body $body `
+        -UseBasicParsing `
+        -Headers @{
+            'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AcerWin11Builder/2.3'
+            'Accept'     = 'text/xml,application/xml,text/plain,*/*'
+        } `
+        -TimeoutSec 120 `
+        -ErrorAction Stop
+
+    $rawPath = Join-Path $LogRoot ("AcerApi-{0:D2}.xml" -f $AttemptNumber)
+    $response.Content | Set-Content -LiteralPath $rawPath -Encoding UTF8
+
+    return $response.Content
+}
+
+function Convert-AcerPayloadToDriverUrls {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory)][int]$AttemptNumber
+    )
+
+    $payloads = New-Object System.Collections.Generic.List[string]
+
+    if ($null -ne $Content) {
+        $payloads.Add([string]$Content)
+    }
+
+    # A resposta do ASMX pode conter XML externo e JSON/XML escapado no InnerText.
+    try {
+        [xml]$outerXml = $Content
+
+        if ($outerXml.DocumentElement -and $outerXml.DocumentElement.InnerText) {
+            $payloads.Add([string]$outerXml.DocumentElement.InnerText)
+        }
+
+        $stringNodes = @($outerXml.SelectNodes("//*[local-name()='string']"))
+
+        foreach ($node in $stringNodes) {
+            if ($node.InnerText) {
+                $payloads.Add([string]$node.InnerText)
+            }
+        }
+    }
+    catch {
+        # Continua usando o conteúdo bruto.
+    }
+
+    $normalizedParts = New-Object System.Collections.Generic.List[string]
+
+    foreach ($part in $payloads) {
+        if ([string]::IsNullOrWhiteSpace($part)) {
+            continue
+        }
+
+        $normalized = [string]$part
+
+        # O ASMX pode devolver entidades duplamente escapadas.
+        for ($n = 0; $n -lt 3; $n++) {
+            $decoded = [System.Net.WebUtility]::HtmlDecode($normalized)
+
+            if ($decoded -eq $normalized) {
+                break
+            }
+
+            $normalized = $decoded
+        }
+
+        # Quando o conteúdo interno é JSON, links podem vir como:
+        # http:\/\/global-download.acer.com\/GDFiles\/Driver\/...
+        $normalized = $normalized.Replace('\/', '/')
+        $normalized = $normalized.Replace('\u0026', '&')
+        $normalized = $normalized.Replace('\u003d', '=')
+        $normalized = $normalized.Replace('\u003f', '?')
+        $normalized = $normalized.Replace('\u002f', '/')
+        $normalized = $normalized.Replace('\u003a', ':')
+        $normalized = $normalized.Replace('\u0020', ' ')
+
+        $normalizedParts.Add($normalized)
+    }
+
+    $combined = $normalizedParts -join "`r`n"
+
+    $normalizedLog = Join-Path `
+        $LogRoot `
+        ("AcerApi-{0:D2}-NORMALIZED.txt" -f $AttemptNumber)
+
+    $combined | Set-Content -LiteralPath $normalizedLog -Encoding UTF8
+
+    $found = New-Object System.Collections.Generic.List[string]
+
+    # URLs absolutas oficiais de drivers.
+    $absoluteMatches = [regex]::Matches(
+        $combined,
+        '(?i)https?://global-download\.acer\.com/GDFiles/Driver/[^<>"''\s]+'
+    )
+
+    foreach ($match in $absoluteMatches) {
+        $url = [string]$match.Value
+        $url = $url.TrimEnd('\', ',', ']', '}', ')')
+
+        if ($url -match '(?i)\.zip(?:\?|$)') {
+            if ($url.StartsWith('http://', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $url = 'https://' + $url.Substring(7)
+            }
+
+            $found.Add($url)
+        }
+    }
+
+    # Também aceita caminhos relativos retornados pela Acer.
+    $relativeMatches = [regex]::Matches(
+        $combined,
+        '(?i)/GDFiles/Driver/[^<>"''\s]+'
+    )
+
+    foreach ($match in $relativeMatches) {
+        $value = [string]$match.Value
+        $value = $value.TrimEnd('\', ',', ']', '}', ')')
+
+        if ($value -notmatch '(?i)\.zip(?:\?|$)') {
+            continue
+        }
+
+        $value = 'https://global-download.acer.com' + $value
+        $found.Add($value)
+    }
+
+    return @(
+        $found |
+        ForEach-Object {
+            [System.Net.WebUtility]::HtmlDecode($_)
+        } |
+        Sort-Object -Unique
+    )
+}
+
+
+function Get-AcerDriverURLs {
+    Write-Step 'CONSULTANDO DRIVERS OFICIAIS DA ACER'
+
+    Write-Host "Modelo : $AcerModel"
+    Write-Host "P/N    : $AcerPartNumber"
+    Write-Host "Serial : $AcerSerial"
+
+    # Para a família TravelMate, a infraestrutura Acer usa com frequência
+    # SC/SiteID PA_6. Esse valor é priorizado.
+    $attempts = @(
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'PA_6';  Language = 'pt'    },
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'PA_6';  Language = 'en'    },
+        @{ OS = 'Windows 11';        SiteID = 'PA_6';  Language = 'pt'    },
+        @{ OS = 'Windows 11';        SiteID = 'PA_6';  Language = 'en'    },
+
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'BR';    Language = 'pt-BR' },
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'BR';    Language = 'pt'    },
+
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'AAP_7'; Language = 'pt'    },
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'AAP_7'; Language = 'en'    },
+
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'PA_3';  Language = 'pt'    },
+        @{ OS = 'Windows 11 64-bit'; SiteID = 'PA_3';  Language = 'en'    }
+    )
+
+    $attemptNumber = 0
+
+    foreach ($attempt in $attempts) {
+        $attemptNumber++
+
+        try {
+            $content = Invoke-AcerDriverApi `
+                -OS $attempt.OS `
+                -SiteID $attempt.SiteID `
+                -Language $attempt.Language `
+                -AttemptNumber $attemptNumber
+
+            $urls = @(
+                Convert-AcerPayloadToDriverUrls `
+                    -Content $content `
+                    -AttemptNumber $attemptNumber
+            )
+
+            if ($urls.Count -gt 0) {
+                Write-Host ''
+                Write-Host "$($urls.Count) pacotes de driver encontrados." `
+                    -ForegroundColor Green
+
+                $urlListPath = Join-Path $LogRoot 'Acer-Driver-URLs.txt'
+                $urls | Set-Content -LiteralPath $urlListPath -Encoding UTF8
+
+                Write-Host "SiteID usado: $($attempt.SiteID)" -ForegroundColor Green
+                Write-Host "Idioma usado: $($attempt.Language)" -ForegroundColor Green
+                Write-Host "SO usado    : $($attempt.OS)" -ForegroundColor Green
+
+                return $urls
+            }
+
+            Write-Host 'Resposta recebida, mas nenhum link Driver/*.zip foi localizado.' `
+                -ForegroundColor DarkYellow
+        }
+        catch {
+            Write-Warning "Falha na consulta Acer: $($_.Exception.Message)"
+        }
+    }
+
+    throw @"
+A API oficial da Acer respondeu, mas não foi possível obter URLs de drivers
+para Windows 11 deste equipamento.
+
+A versão 2.3 salvou, para cada tentativa:
+  AcerApi-XX.xml
+  AcerApi-XX-NORMALIZED.txt
+
+em:
+$LogRoot
+
+O pendrive não foi alterado.
+"@
+}
+
+
+function Get-DownloadFileNameFromUrl {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][int]$Number
+    )
+
+    $uri = [Uri]$Url
+    $name = [Uri]::UnescapeDataString([IO.Path]::GetFileName($uri.AbsolutePath))
+
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = "AcerDriver-$Number.zip"
+    }
+
+    $name = $name -replace '[\\/:*?"<>|]', '_'
+
+    return ('{0:D3}_{1}' -f $Number, $name)
+}
+
+function Download-AcerDrivers {
+    param([Parameter(Mandatory)][string[]]$URLs)
+
+    Write-Step 'BAIXANDO DRIVERS DA ACER'
+
+    Ensure-Directory -Path $DownloadRoot
+
+    $downloadedFiles = @()
+    $number = 0
+
+    foreach ($url in $URLs) {
+        $number++
+        $fileName = Get-DownloadFileNameFromUrl -Url $url -Number $number
+        $destination = Join-Path $DownloadRoot $fileName
+
+        Write-Host ''
+        Write-Host "[$number/$($URLs.Count)] $fileName" -ForegroundColor Yellow
+
+        if ((Test-Path -LiteralPath $destination) -and
+            ((Get-Item -LiteralPath $destination).Length -gt 1024)) {
+
+            Write-Host 'Já existe no cache. Reutilizando.' -ForegroundColor DarkGray
+            $downloadedFiles += Get-Item -LiteralPath $destination
+            continue
+        }
+
+        $ok = $false
+
+        for ($try = 1; $try -le 3; $try++) {
+            try {
+                Invoke-WebRequest `
+                    -Uri $url `
+                    -OutFile $destination `
+                    -UseBasicParsing `
+                    -Headers @{ 'User-Agent' = 'Mozilla/5.0' } `
+                    -TimeoutSec 600 `
+                    -ErrorAction Stop
+
+                if ((Get-Item -LiteralPath $destination).Length -le 1024) {
+                    throw 'O arquivo baixado parece estar vazio ou incompleto.'
+                }
+
+                $ok = $true
+                break
+            }
+            catch {
+                Write-Warning "Tentativa $try falhou: $($_.Exception.Message)"
+
+                if (Test-Path -LiteralPath $destination) {
+                    Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+                }
+
+                Start-Sleep -Seconds 3
+            }
+        }
+
+        if ($ok) {
+            $downloadedFiles += Get-Item -LiteralPath $destination
+        }
+        else {
+            Write-Warning "Não foi possível baixar: $url"
+        }
+    }
+
+    if ($downloadedFiles.Count -eq 0) {
+        throw 'Nenhum pacote de driver foi baixado.'
+    }
+
+    Write-Host ''
+    Write-Host "$($downloadedFiles.Count) pacotes disponíveis para extração." -ForegroundColor Green
+
+    return $downloadedFiles
+}
+
+function Expand-AcerDrivers {
+    Write-Step 'EXTRAINDO PACOTES DE DRIVER'
+
+    if (Test-Path -LiteralPath $DriverRoot) {
+        Remove-Item -LiteralPath $DriverRoot -Recurse -Force
+    }
+
+    Ensure-Directory -Path $DriverRoot
+
+    $topLevelZips = @(
+        Get-ChildItem -LiteralPath $DownloadRoot -Filter '*.zip' -File -ErrorAction Stop
+    )
+
+    if ($topLevelZips.Count -eq 0) {
+        throw "Nenhum ZIP encontrado em $DownloadRoot"
+    }
+
+    $counter = 0
+
+    foreach ($zip in $topLevelZips) {
+        $counter++
+
+        $folderName = $zip.BaseName -replace '[\\/:*?"<>|]', '_'
+        $destination = Join-Path $DriverRoot $folderName
+
+        Ensure-Directory -Path $destination
+
+        Write-Host "[$counter/$($topLevelZips.Count)] $($zip.Name)" -ForegroundColor Yellow
+
+        try {
+            Expand-Archive `
+                -LiteralPath $zip.FullName `
+                -DestinationPath $destination `
+                -Force `
+                -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Falha ao extrair $($zip.Name): $($_.Exception.Message)"
+        }
+    }
+
+    # Extrai ZIPs aninhados em até 3 níveis adicionais.
+    for ($depth = 1; $depth -le 3; $depth++) {
+        $nested = @(
+            Get-ChildItem `
+                -LiteralPath $DriverRoot `
+                -Filter '*.zip' `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+            Where-Object {
+                -not (Test-Path -LiteralPath ($_.FullName + '.extracted'))
+            }
+        )
+
+        if ($nested.Count -eq 0) {
+            break
+        }
+
+        Write-Host "Extraindo ZIPs internos - nível $depth..." -ForegroundColor DarkGray
+
+        foreach ($zip in $nested) {
+            $destination = $zip.FullName + '.extracted'
+            Ensure-Directory -Path $destination
+
+            try {
+                Expand-Archive `
+                    -LiteralPath $zip.FullName `
+                    -DestinationPath $destination `
+                    -Force `
+                    -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "ZIP interno ignorado: $($zip.FullName)"
+            }
+        }
+    }
+}
+
+function Get-AllDriverInfFiles {
+    $infFiles = @(
+        Get-ChildItem `
+            -LiteralPath $DriverRoot `
+            -Filter '*.inf' `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Unique
+    )
+
+    if ($infFiles.Count -eq 0) {
+        throw "Nenhum arquivo INF foi encontrado após extrair os drivers em $DriverRoot"
+    }
+
+    return $infFiles
+}
+
+function Get-BootCriticalInfFiles {
+    param([Parameter(Mandatory)][System.IO.FileInfo[]]$InfFiles)
+
+    Write-Step 'IDENTIFICANDO DRIVERS DE STORAGE E REDE PARA O BOOT.WIM'
+
+    $selected = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+
+    foreach ($inf in $InfFiles) {
+        try {
+            # INF é texto; 500 linhas normalmente incluem Version/Class.
+            $head = (Get-Content -LiteralPath $inf.FullName -TotalCount 500 -ErrorAction Stop) -join "`n"
+
+            $classMatch = $head -match '(?im)^\s*Class\s*=\s*(SCSIAdapter|HDC|Net)\s*$'
+            $nameMatch  = $inf.Name -match '(?i)iastor|vmd|rst|raid|nvme|ethernet|wifi|wireless|wlan'
+
+            if ($classMatch -or $nameMatch) {
+                $selected.Add($inf)
+            }
+        }
+        catch {
+            # Arquivo INF ilegível: ignora.
+        }
+    }
+
+    $result = @($selected | Sort-Object FullName -Unique)
+
+    Write-Host "INF críticos encontrados: $($result.Count)" -ForegroundColor Green
+
+    if ($result.Count -eq 0) {
+        Write-Warning 'Nenhum INF de storage/rede foi identificado para o boot.wim.'
+    }
+
+    return $result
+}
+
+# =============================================================================
+# PREPARAÇÃO DAS IMAGENS WINDOWS
+# =============================================================================
+
+function Get-InstallSourceInfo {
+    param([Parameter(Mandatory)][string]$SourcesPath)
+
+    $wim = Join-Path $SourcesPath 'install.wim'
+    $esd = Join-Path $SourcesPath 'install.esd'
+    $swm = Join-Path $SourcesPath 'install.swm'
+
+    if (Test-Path -LiteralPath $wim) {
+        return [PSCustomObject]@{
+            Type         = 'WIM'
+            Path         = $wim
+            SplitPattern = $null
+            Files        = @((Get-Item -LiteralPath $wim))
+        }
+    }
+
+    if (Test-Path -LiteralPath $esd) {
+        return [PSCustomObject]@{
+            Type         = 'ESD'
+            Path         = $esd
+            SplitPattern = $null
+            Files        = @((Get-Item -LiteralPath $esd))
+        }
+    }
+
+    if (Test-Path -LiteralPath $swm) {
+        $swmFiles = @(
+            Get-ChildItem `
+                -LiteralPath $SourcesPath `
+                -Filter 'install*.swm' `
+                -File `
+                -ErrorAction Stop |
+            Sort-Object Name
+        )
+
+        if ($swmFiles.Count -eq 0) {
+            throw 'install.swm existe, mas não foi possível enumerar o conjunto install*.swm.'
+        }
+
+        $splitPattern = Join-Path $SourcesPath 'install*.swm'
+
+        Write-Host ''
+        Write-Host 'A mídia contém uma imagem Windows dividida (.SWM).' -ForegroundColor Yellow
+        Write-Host "Partes encontradas: $($swmFiles.Count)" -ForegroundColor Yellow
+        Write-Host 'O script reconstruirá um install.wim local antes de injetar os drivers.' `
+            -ForegroundColor Yellow
+
+        return [PSCustomObject]@{
+            Type         = 'SWM'
+            Path         = $swm
+            SplitPattern = $splitPattern
+            Files        = $swmFiles
+        }
+    }
+
+    throw 'Não encontrei sources\install.wim, sources\install.esd nem sources\install.swm.'
+}
+
+function Copy-OriginalImagesToBackup {
+    param(
+        [Parameter(Mandatory)][string]$UsbBootWim,
+        [Parameter(Mandatory)]$InstallSource
+    )
+
+    Write-Step 'CRIANDO BACKUP LOCAL DAS IMAGENS ORIGINAIS'
+
+    Ensure-Directory -Path $BackupRoot
+
+    Copy-Item -LiteralPath $UsbBootWim -Destination $BackupRoot -Force
+
+    if ($InstallSource.Type -eq 'SWM') {
+        foreach ($file in @($InstallSource.Files)) {
+            Copy-Item -LiteralPath $file.FullName -Destination $BackupRoot -Force
+        }
+    }
+    else {
+        Copy-Item -LiteralPath $InstallSource.Path -Destination $BackupRoot -Force
+    }
+
+    Write-Host "Backup: $BackupRoot" -ForegroundColor Green
+}
+
+function Convert-InstallSourceToWorkingWim {
+    param(
+        [Parameter(Mandatory)]$InstallSource,
+        [Parameter(Mandatory)][string]$DestinationWim
+    )
+
+    Write-Step 'PREPARANDO INSTALL.WIM DE TRABALHO'
+
+    if (Test-Path -LiteralPath $DestinationWim) {
+        Remove-Item -LiteralPath $DestinationWim -Force
+    }
+
+    if ($InstallSource.Type -eq 'WIM') {
+        Write-Host 'A mídia já possui install.wim. Copiando para o disco local...'
+        Copy-Item -LiteralPath $InstallSource.Path -Destination $DestinationWim -Force
+        Set-FileWritable -Path $DestinationWim
+        return
+    }
+
+    if ($InstallSource.Type -eq 'SWM') {
+        Write-Host 'A mídia possui install.swm/install2.swm...' -ForegroundColor Yellow
+        Write-Host 'Reconstruindo um install.wim local a partir do conjunto SWM...' `
+            -ForegroundColor Yellow
+
+        # IMPORTANTE:
+        # /Get-WimInfo consulta diretamente o primeiro arquivo install.swm.
+        # NÃO use /SWMFile com /Get-WimInfo.
+        #
+        # /SWMFile (ou -SplitImageFilePattern no PowerShell) é usado depois,
+        # no momento de exportar/aplicar a imagem dividida.
+
+        $getInfoLog = Join-Path $LogRoot 'SWM-GetWimInfo.log'
+
+        $dismOutput = @(
+            & dism.exe `
+                '/English' `
+                '/Get-WimInfo' `
+                "/WimFile:$($InstallSource.Path)" 2>&1
+        )
+
+        $dismExitCode = $LASTEXITCODE
+        $dismText = $dismOutput -join "`r`n"
+
+        $dismText |
+            Set-Content `
+                -LiteralPath $getInfoLog `
+                -Encoding UTF8
+
+        $indices = @()
+
+        if ($dismExitCode -eq 0) {
+            $indexMatches = [regex]::Matches(
+                $dismText,
+                '(?im)^\s*Index\s*:\s*(\d+)\s*$'
+            )
+
+            $indices = @(
+                $indexMatches |
+                ForEach-Object { [int]$_.Groups[1].Value } |
+                Sort-Object -Unique
+            )
+        }
+
+        # Fallback defensivo:
+        # alguns builds/idiomas do DISM podem não retornar a listagem completa
+        # como esperado. Nesse caso, consultamos índices sequenciais.
+        if ($indices.Count -eq 0) {
+            Write-Warning 'A listagem geral do SWM não retornou índices. Testando índices individualmente...'
+
+            $probeIndices = New-Object System.Collections.Generic.List[int]
+
+            for ($probe = 1; $probe -le 50; $probe++) {
+                $probeOutput = @(
+                    & dism.exe `
+                        '/English' `
+                        '/Get-WimInfo' `
+                        "/WimFile:$($InstallSource.Path)" `
+                        "/Index:$probe" 2>&1
+                )
+
+                $probeExit = $LASTEXITCODE
+
+                if ($probeExit -eq 0) {
+                    $probeIndices.Add($probe)
+
+                    Add-Content `
+                        -LiteralPath $getInfoLog `
+                        -Value ("`r`n===== INDEX {0} =====`r`n{1}" -f $probe, ($probeOutput -join "`r`n"))
+                }
+                elseif ($probeIndices.Count -gt 0) {
+                    # Índices de WIM são contíguos; a primeira falha depois
+                    # de índices válidos indica o final da lista.
+                    break
+                }
+            }
+
+            $indices = @($probeIndices)
+        }
+
+        if ($indices.Count -eq 0) {
+            throw @"
+O DISM não conseguiu identificar nenhum índice no conjunto SWM.
+
+Comando principal usado:
+DISM /English /Get-WimInfo /WimFile:"$($InstallSource.Path)"
+
+Saída salva em:
+$getInfoLog
+"@
+        }
+
+        Write-Host "Índices encontrados no SWM: $($indices -join ', ')" `
+            -ForegroundColor Green
+
+        foreach ($index in $indices) {
+            Write-Host "Exportando índice $index do SWM para install.wim..." `
+                -ForegroundColor Yellow
+
+            # Para fonte SWM, a Microsoft exige SplitImageFilePattern.
+            Export-WindowsImage `
+                -SourceImagePath $InstallSource.Path `
+                -SplitImageFilePattern $InstallSource.SplitPattern `
+                -SourceIndex $index `
+                -DestinationImagePath $DestinationWim `
+                -CompressionType Max `
+                -CheckIntegrity `
+                -ErrorAction Stop | Out-Null
+        }
+
+        if (-not (Test-Path -LiteralPath $DestinationWim)) {
+            throw 'A reconstrução SWM -> WIM terminou sem gerar install.wim.'
+        }
+
+        Set-FileWritable -Path $DestinationWim
+
+        Write-Host ''
+        Write-Host 'Reconstrução SWM -> WIM concluída.' -ForegroundColor Green
+
+        Write-Host 'Validando índices do WIM reconstruído...' -ForegroundColor DarkGray
+
+        $rebuiltImages = @(
+            Get-WindowsImage `
+                -ImagePath $DestinationWim `
+                -ErrorAction Stop
+        )
+
+        if ($rebuiltImages.Count -ne $indices.Count) {
+            throw @"
+O install.wim foi criado, mas a quantidade de índices não confere.
+
+SWM original : $($indices.Count) índice(s)
+WIM criado   : $($rebuiltImages.Count) índice(s)
+
+O pendrive ainda não foi alterado.
+"@
+        }
+
+        $rebuiltImages |
+            Select-Object ImageIndex, ImageName, Architecture |
+            Format-Table -AutoSize | Out-Host
+
+        return
+    }
+
+    if ($InstallSource.Type -ne 'ESD') {
+        throw "Tipo de imagem não suportado: $($InstallSource.Type)"
+    }
+
+    Write-Host 'A mídia possui install.esd. Convertendo todos os índices para WIM...' `
+        -ForegroundColor Yellow
+
+    $images = @(Get-WindowsImage `
+        -ImagePath $InstallSource.Path `
+        -ErrorAction Stop)
+
+    if ($images.Count -eq 0) {
+        throw 'Nenhum índice foi encontrado no install.esd.'
+    }
+
+    foreach ($image in $images) {
+        Write-Host "Exportando índice $($image.ImageIndex): $($image.ImageName)" `
+            -ForegroundColor Yellow
+
+        Export-WindowsImage `
+            -SourceImagePath $InstallSource.Path `
+            -SourceIndex $image.ImageIndex `
+            -DestinationImagePath $DestinationWim `
+            -CompressionType Max `
+            -CheckIntegrity `
+            -ErrorAction Stop | Out-Null
+    }
+
+    if (-not (Test-Path -LiteralPath $DestinationWim)) {
+        throw 'A conversão ESD -> WIM terminou sem gerar install.wim.'
+    }
+
+    Set-FileWritable -Path $DestinationWim
+}
+
+function Add-InfSetToMountedImage {
+    param(
+        [Parameter(Mandatory)][string]$MountPath,
+        [Parameter(Mandatory)][System.IO.FileInfo[]]$InfFiles,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $added   = 0
+    $skipped = 0
+    $failed  = 0
+    $i       = 0
+
+    foreach ($inf in $InfFiles) {
+        $i++
+
+        if (($i -eq 1) -or ($i % 10 -eq 0) -or ($i -eq $InfFiles.Count)) {
+            Write-Host "${Label}: processando $i de $($InfFiles.Count)..." -ForegroundColor DarkGray
+        }
+
+        try {
+            Add-WindowsDriver `
+                -Path $MountPath `
+                -Driver $inf.FullName `
+                -ErrorAction Stop | Out-Null
+
+            $added++
+        }
+        catch {
+            $message = $_.Exception.Message
+
+            if ($message -match '(?i)already|já está|not applicable|não é aplicável|architecture|arquitetura') {
+                $skipped++
+            }
+            else {
+                $failed++
+
+                Add-Content `
+                    -LiteralPath (Join-Path $LogRoot 'DriverInjection-Warnings.log') `
+                    -Value ("[{0}] {1}`r`n{2}`r`n" -f (Get-Date), $inf.FullName, $message)
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Added   = $added
+        Skipped = $skipped
+        Failed  = $failed
+        Total   = $InfFiles.Count
+    }
+}
+
+function Service-InstallWim {
+    param(
+        [Parameter(Mandatory)][string]$InstallWim,
+        [Parameter(Mandatory)][System.IO.FileInfo[]]$AllInfFiles
+    )
+
+    Write-Step 'INJETANDO TODOS OS DRIVERS ACER NO WINDOWS 11'
+
+    $images = @(Get-WindowsImage -ImagePath $InstallWim -ErrorAction Stop)
+
+    $images |
+        Select-Object ImageIndex, ImageName, Architecture |
+        Format-Table -AutoSize | Out-Host
+
+    if ($InjectIntoAllEditions) {
+        $targets = $images
+    }
+    else {
+        $targets = @(
+            $images | Where-Object { $_.ImageName -eq $PreferredEdition }
+        )
+
+        if ($targets.Count -eq 0) {
+            Write-Warning "'$PreferredEdition' não foi encontrado. Todos os índices serão atualizados."
+            $targets = $images
+        }
+    }
+
+    foreach ($image in $targets) {
+        Write-Host ''
+        Write-Host "Montando índice $($image.ImageIndex): $($image.ImageName)" `
+            -ForegroundColor Green
+
+        if (Test-Path -LiteralPath $MountInstall) {
+            Get-ChildItem -LiteralPath $MountInstall -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Mount-WindowsImage `
+            -ImagePath $InstallWim `
+            -Index $image.ImageIndex `
+            -Path $MountInstall `
+            -CheckIntegrity `
+            -ErrorAction Stop | Out-Null
+
+        $commit = $false
+
+        try {
+            $stats = Add-InfSetToMountedImage `
+                -MountPath $MountInstall `
+                -InfFiles $AllInfFiles `
+                -Label "install.wim índice $($image.ImageIndex)"
+
+            Write-Host "Adicionados: $($stats.Added) | Ignorados: $($stats.Skipped) | Falhas: $($stats.Failed)" `
+                -ForegroundColor Green
+
+            $commit = $true
+        }
+        finally {
+            if ($commit) {
+                Dismount-WindowsImage `
+                    -Path $MountInstall `
+                    -Save `
+                    -CheckIntegrity `
+                    -ErrorAction Stop | Out-Null
+            }
+            else {
+                Dismount-WindowsImage `
+                    -Path $MountInstall `
+                    -Discard `
+                    -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+    }
+}
+
+function Service-BootWim {
+    param(
+        [Parameter(Mandatory)][string]$BootWim,
+        [Parameter(Mandatory)][System.IO.FileInfo[]]$BootInfFiles
+    )
+
+    Write-Step 'INJETANDO STORAGE/REDE NO BOOT.WIM'
+
+    if ($BootInfFiles.Count -eq 0) {
+        Write-Warning 'Nenhum driver crítico selecionado. O boot.wim será mantido sem alterações.'
+        return
+    }
+
+    $images = @(Get-WindowsImage -ImagePath $BootWim -ErrorAction Stop)
+
+    foreach ($image in $images) {
+        Write-Host ''
+        Write-Host "Montando boot.wim índice $($image.ImageIndex): $($image.ImageName)" `
+            -ForegroundColor Green
+
+        if (Test-Path -LiteralPath $MountBoot) {
+            Get-ChildItem -LiteralPath $MountBoot -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Mount-WindowsImage `
+            -ImagePath $BootWim `
+            -Index $image.ImageIndex `
+            -Path $MountBoot `
+            -CheckIntegrity `
+            -ErrorAction Stop | Out-Null
+
+        $commit = $false
+
+        try {
+            $stats = Add-InfSetToMountedImage `
+                -MountPath $MountBoot `
+                -InfFiles $BootInfFiles `
+                -Label "boot.wim índice $($image.ImageIndex)"
+
+            Write-Host "Adicionados: $($stats.Added) | Ignorados: $($stats.Skipped) | Falhas: $($stats.Failed)" `
+                -ForegroundColor Green
+
+            $commit = $true
+        }
+        finally {
+            if ($commit) {
+                Dismount-WindowsImage `
+                    -Path $MountBoot `
+                    -Save `
+                    -CheckIntegrity `
+                    -ErrorAction Stop | Out-Null
+            }
+            else {
+                Dismount-WindowsImage `
+                    -Path $MountBoot `
+                    -Discard `
+                    -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+    }
+}
+
+# IMPORTANTE v2.6:
+# Esta função deve devolver SOMENTE objetos System.IO.FileInfo.
+# Saída de Format-Table é enviada a Out-Host para não contaminar o pipeline.
+function Split-WorkingInstallWim {
+    param(
+        [Parameter(Mandatory)][string]$InstallWim,
+        [Parameter(Mandatory)][string]$DestinationDirectory
+    )
+
+    Write-Step 'DIVIDINDO INSTALL.WIM PARA O PENDRIVE FAT32'
+
+    Ensure-Directory -Path $DestinationDirectory
+
+    Get-ChildItem -LiteralPath $DestinationDirectory -Filter 'install*.swm' -File `
+        -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+
+    $firstSwm = Join-Path $DestinationDirectory 'install.swm'
+
+    Split-WindowsImage `
+        -ImagePath $InstallWim `
+        -SplitImagePath $firstSwm `
+        -FileSize $SplitSizeMB `
+        -CheckIntegrity `
+        -ErrorAction Stop | Out-Null
+
+    $swmFiles = @(
+        Get-ChildItem -LiteralPath $DestinationDirectory -Filter 'install*.swm' -File |
+        Sort-Object Name
+    )
+
+    if ($swmFiles.Count -eq 0) {
+        throw 'Split-WindowsImage não gerou arquivos SWM.'
+    }
+
+    foreach ($file in $swmFiles) {
+        if ($file.Length -ge 4GB) {
+            throw "$($file.Name) ficou com 4 GB ou mais, incompatível com FAT32."
+        }
+    }
+
+    $swmFiles |
+        Select-Object Name, @{N='TamanhoGB';E={[math]::Round($_.Length / 1GB, 2)}} |
+        Format-Table -AutoSize | Out-Host
+
+    foreach ($swmFile in $swmFiles) {
+        $swmFile
+    }
+}
+
+# =============================================================================
+# ATUALIZAÇÃO / RESTAURAÇÃO DO USB
+# =============================================================================
+
+function Get-ReclaimableUsbImageBytes {
+    param([Parameter(Mandatory)][string]$SourcesPath)
+
+    $files = @()
+
+    foreach ($name in @('boot.wim', 'install.wim', 'install.esd')) {
+        $path = Join-Path $SourcesPath $name
+        if (Test-Path -LiteralPath $path) {
+            $files += Get-Item -LiteralPath $path
+        }
+    }
+
+    $files += @(
+        Get-ChildItem -LiteralPath $SourcesPath -Filter 'install*.swm' -File `
+            -ErrorAction SilentlyContinue
+    )
+
+    if ($files.Count -eq 0) {
+        return 0
+    }
+
+    return [int64](($files | Measure-Object Length -Sum).Sum)
+}
+
+function Test-UsbCapacityForImages {
+    param(
+        [Parameter(Mandatory)][string]$UsbRoot,
+        [Parameter(Mandatory)][string]$WorkingBootWim,
+        [Parameter(Mandatory)][System.IO.FileInfo[]]$SwmFiles
+    )
+
+    Write-Step 'VALIDANDO ESPAÇO NO PENDRIVE'
+
+    $driveName = $UsbRoot.TrimEnd(':').TrimEnd('\')
+    $drive = Get-PSDrive -Name $driveName -ErrorAction Stop
+
+    $reclaimable = Get-ReclaimableUsbImageBytes -SourcesPath $script:UsbSources
+
+    $newBytes = [int64](Get-Item -LiteralPath $WorkingBootWim).Length +
+                [int64](($SwmFiles | Measure-Object Length -Sum).Sum)
+
+    $availableAfterReplacing = [int64]$drive.Free + [int64]$reclaimable
+
+    Write-Host "Livre agora               : $([math]::Round($drive.Free / 1GB, 2)) GB"
+    Write-Host "Recuperável nas imagens   : $([math]::Round($reclaimable / 1GB, 2)) GB"
+    Write-Host "Necessário novas imagens  : $([math]::Round($newBytes / 1GB, 2)) GB"
+
+    if ($newBytes -gt $availableAfterReplacing) {
+        throw @"
+O pendrive não possui espaço suficiente para as novas imagens.
+
+Nada foi alterado no pendrive.
+
+Use um pendrive maior (16 GB ou 32 GB recomendado).
+"@
+    }
+}
+
+function Restore-UsbOriginalImages {
+    if (-not $script:UsbUpdateStarted) {
+        return
+    }
+
+    if (-not $script:UsbSources) {
+        return
+    }
+
+    Write-Warning 'Tentando restaurar as imagens originais do pendrive a partir do backup local...'
+
+    try {
+        # Remove imagens de instalação que possam ter sido gravadas parcialmente.
+        Remove-Item -LiteralPath (Join-Path $script:UsbSources 'install.wim') `
+            -Force -ErrorAction SilentlyContinue
+
+        Remove-Item -LiteralPath (Join-Path $script:UsbSources 'install.esd') `
+            -Force -ErrorAction SilentlyContinue
+
+        Get-ChildItem -LiteralPath $script:UsbSources -Filter 'install*.swm' -File `
+            -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+
+        $backupBoot = Join-Path $BackupRoot 'boot.wim'
+
+        if (Test-Path -LiteralPath $backupBoot) {
+            Copy-Item `
+                -LiteralPath $backupBoot `
+                -Destination (Join-Path $script:UsbSources 'boot.wim') `
+                -Force
+        }
+
+        if ($script:OriginalInstallType -eq 'SWM') {
+            $backupSwmFiles = @(
+                Get-ChildItem `
+                    -LiteralPath $BackupRoot `
+                    -Filter 'install*.swm' `
+                    -File `
+                    -ErrorAction SilentlyContinue
+            )
+
+            if ($backupSwmFiles.Count -eq 0) {
+                throw 'O backup não contém o conjunto install*.swm original.'
+            }
+
+            foreach ($file in $backupSwmFiles) {
+                Copy-Item `
+                    -LiteralPath $file.FullName `
+                    -Destination $script:UsbSources `
+                    -Force
+            }
+        }
+        elseif ($script:OriginalInstallPath) {
+            $backupInstall = Join-Path `
+                $BackupRoot `
+                ([IO.Path]::GetFileName($script:OriginalInstallPath))
+
+            if (Test-Path -LiteralPath $backupInstall) {
+                Copy-Item `
+                    -LiteralPath $backupInstall `
+                    -Destination (Join-Path `
+                        $script:UsbSources `
+                        ([IO.Path]::GetFileName($script:OriginalInstallPath))) `
+                    -Force
+            }
+        }
+
+        Write-Warning 'Restauração automática concluída.'
+    }
+    catch {
+        Write-Warning "A restauração automática também falhou: $($_.Exception.Message)"
+        Write-Warning "Backup disponível manualmente em: $BackupRoot"
+    }
+}
+
+function Update-UsbImages {
+    param(
+        [Parameter(Mandatory)][string]$UsbBootWim,
+        [Parameter(Mandatory)][string]$WorkingBootWim,
+        [Parameter(Mandatory)][System.IO.FileInfo[]]$SwmFiles
+    )
+
+    Write-Step 'ATUALIZANDO O PENDRIVE'
+
+    $script:UsbUpdateStarted = $true
+
+    # Remove atributos de somente leitura quando existirem.
+    Set-FileWritable -Path $UsbBootWim
+
+    foreach ($path in @(
+        (Join-Path $script:UsbSources 'install.wim'),
+        (Join-Path $script:UsbSources 'install.esd')
+    )) {
+        Set-FileWritable -Path $path
+    }
+
+    # Remove imagens antigas SOMENTE agora, depois que todas as imagens locais
+    # foram criadas e o espaço foi validado.
+    Remove-Item -LiteralPath (Join-Path $script:UsbSources 'install.wim') `
+        -Force -ErrorAction SilentlyContinue
+
+    Remove-Item -LiteralPath (Join-Path $script:UsbSources 'install.esd') `
+        -Force -ErrorAction SilentlyContinue
+
+    Get-ChildItem -LiteralPath $script:UsbSources -Filter 'install*.swm' -File `
+        -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Set-FileWritable -Path $_.FullName
+            Remove-Item -LiteralPath $_.FullName -Force
+        }
+
+    Write-Host 'Copiando install.swm/install2.swm...' -ForegroundColor Yellow
+
+    foreach ($swm in $SwmFiles) {
+        Copy-Item -LiteralPath $swm.FullName -Destination $script:UsbSources -Force
+    }
+
+    Write-Host 'Substituindo boot.wim...' -ForegroundColor Yellow
+
+    Copy-Item -LiteralPath $WorkingBootWim -Destination $UsbBootWim -Force
+
+    Write-Host 'Imagens atualizadas no pendrive.' -ForegroundColor Green
+}
+
+function Copy-DriverRepositoryToUsbIfPossible {
+    param([Parameter(Mandatory)][string]$UsbRoot)
+
+    if (-not $CopyDriversToUSB) {
+        return
+    }
+
+    Write-Step 'COPIANDO REPOSITÓRIO DE DRIVERS PARA O PENDRIVE'
+
+    $driverBytes = [int64]((
+        Get-ChildItem -LiteralPath $DriverRoot -File -Recurse |
+        Measure-Object Length -Sum
+    ).Sum)
+
+    $driveName = $UsbRoot.TrimEnd(':').TrimEnd('\')
+    $drive = Get-PSDrive -Name $driveName -ErrorAction Stop
+
+    # Reserva 250 MB de folga.
+    if (($driverBytes + 250MB) -gt $drive.Free) {
+        Write-Warning 'Não há espaço suficiente para copiar a pasta AcerDrivers.'
+        Write-Warning "Os drivers permanecem em: $DriverRoot"
+        return
+    }
+
+    $usbDriverRoot = Join-Path $UsbRoot 'AcerDrivers'
+
+    if (Test-Path -LiteralPath $usbDriverRoot) {
+        Remove-Item -LiteralPath $usbDriverRoot -Recurse -Force
+    }
+
+    Copy-Item -LiteralPath $DriverRoot -Destination $usbDriverRoot -Recurse -Force
+
+    Write-Host "Drivers copiados para: $usbDriverRoot" -ForegroundColor Green
+}
+
+function Verify-FinalUsb {
+    param([Parameter(Mandatory)][string]$UsbRoot)
+
+    Write-Step 'VERIFICAÇÃO FINAL'
+
+    $boot = Join-Path $UsbRoot 'sources\boot.wim'
+    $firstSwm = Join-Path $UsbRoot 'sources\install.swm'
+
+    if (-not (Test-Path -LiteralPath $boot)) {
+        throw 'Verificação final: boot.wim não encontrado.'
+    }
+
+    if (-not (Test-Path -LiteralPath $firstSwm)) {
+        throw 'Verificação final: install.swm não encontrado.'
+    }
+
+    $swmFiles = @(
+        Get-ChildItem -LiteralPath (Join-Path $UsbRoot 'sources') `
+            -Filter 'install*.swm' -File |
+        Sort-Object Name
+    )
+
+    Write-Host 'boot.wim:' -ForegroundColor Cyan
+    Get-WindowsImage -ImagePath $boot |
+        Select-Object ImageIndex, ImageName |
+        Format-Table -AutoSize | Out-Host
+
+    Write-Host 'Arquivos da imagem de instalação:' -ForegroundColor Cyan
+    $swmFiles |
+        Select-Object Name, @{N='TamanhoGB';E={[math]::Round($_.Length / 1GB, 2)}} |
+        Format-Table -AutoSize | Out-Host
+
+    if ($swmFiles.Count -eq 0) {
+        throw 'Nenhum install*.swm foi encontrado após a cópia.'
+    }
+
+    Write-Host 'Estrutura final do pendrive validada.' -ForegroundColor Green
+}
+
+# =============================================================================
+# EXECUÇÃO
+# =============================================================================
+
+Clear-Host
+
+Write-Host ''
+Write-Host 'WINDOWS 11 + DRIVERS ACER TMP214-55' -ForegroundColor Green
+Write-Host 'Versão do script: 2.7 SCCM Acer' -ForegroundColor Green
+Write-Host ''
+
+Test-Administrator
+
+# TLS 1.2 para o site da Acer em Windows PowerShell 5.1.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+catch {
+    Write-Warning 'Não foi possível forçar TLS 1.2; continuando com a configuração do sistema.'
+}
+
+Import-Module Dism -ErrorAction Stop
+
+# Verifica espaço local antes de baixar/manipular imagens.
+$systemDriveName = $env:SystemDrive.TrimEnd(':')
+$systemDrive = Get-PSDrive -Name $systemDriveName -ErrorAction Stop
+$freeLocalGB = [math]::Round($systemDrive.Free / 1GB, 2)
+
+Write-Host "Espaço livre em $env:SystemDrive : $freeLocalGB GB"
+
+if ($freeLocalGB -lt 35) {
+    throw @"
+Há menos de 35 GB livres em $env:SystemDrive.
+
+Para trabalhar com ESD/WIM, drivers, mounts e backups, libere espaço antes
+de continuar. Recomendo pelo menos 40 GB para o pacote SCCM + WIM/SWM + backup.
+"@
+}
+
+# v2.7:
+# 1) primeiro valida se o pendrive existe (inclusive mídia com install*.swm);
+# 2) somente depois limpa/recria as pastas temporárias locais.
+# Assim, uma falha de detecção do USB não apaga Images/Drivers/Output.
+Remove-OurMountedImages
+
+$usb = Find-WindowsUSB
+
+Reset-RunDirectories
+
+Start-Transcript -Path (Join-Path $LogRoot 'Processo.log') -Force | Out-Null
+$script:TranscriptStarted = $true
+
+try {
+    # -------------------------------------------------------------------------
+    # 1. Pendrive
+    # -------------------------------------------------------------------------
+    $script:UsbRoot = $usb
+    $script:UsbSources = Join-Path $usb 'sources'
+
+    $usbBootWim = Join-Path $script:UsbSources 'boot.wim'
+    $installSource = Get-InstallSourceInfo -SourcesPath $script:UsbSources
+
+    $script:OriginalInstallType = $installSource.Type
+    $script:OriginalInstallPath = $installSource.Path
+    $script:OriginalInstallFiles = @($installSource.Files)
+
+    Write-Host ''
+    Write-Host "Mídia: $usb" -ForegroundColor Green
+    Write-Host "Imagem de instalação original: $($installSource.Path)"
+    Write-Host "Tipo: $($installSource.Type)"
+
+
+
+    if ($installSource.Type -eq 'SWM') {
+
+        Write-Host "Partes SWM: $($installSource.Files.Count)" -ForegroundColor Yellow
+
+    }
+
+    # -------------------------------------------------------------------------
+    # 2. Drivers Acer - pacote SCCM oficial Windows 11 25H2
+    # -------------------------------------------------------------------------
+    $acerCab = Download-AcerSccmPack
+
+    Expand-AcerSccmPack `
+        -CabPath $acerCab.FullName
+
+    Write-Step 'ANALISANDO ARQUIVOS INF'
+
+    $allInf = @(Get-AllDriverInfFiles)
+    Write-Host "Total de arquivos INF encontrados: $($allInf.Count)" -ForegroundColor Green
+
+    $bootInf = @(Get-BootCriticalInfFiles -InfFiles $allInf)
+
+    # -------------------------------------------------------------------------
+    # 3. Backup local
+    # -------------------------------------------------------------------------
+    Copy-OriginalImagesToBackup `
+        -UsbBootWim $usbBootWim `
+        -InstallSource $installSource
+
+    # -------------------------------------------------------------------------
+    # 4. Imagens de trabalho
+    # -------------------------------------------------------------------------
+    $workingBootWim = Join-Path $ImageRoot 'boot.wim'
+    $workingInstallWim = Join-Path $ImageRoot 'install.wim'
+
+    Write-Step 'COPIANDO BOOT.WIM PARA O DISCO LOCAL'
+
+    Copy-Item -LiteralPath $usbBootWim -Destination $workingBootWim -Force
+    Set-FileWritable -Path $workingBootWim
+
+    Convert-InstallSourceToWorkingWim `
+        -InstallSource $installSource `
+        -DestinationWim $workingInstallWim
+
+    # -------------------------------------------------------------------------
+    # 5. Injeção
+    # -------------------------------------------------------------------------
+    Service-InstallWim `
+        -InstallWim $workingInstallWim `
+        -AllInfFiles $allInf
+
+    Service-BootWim `
+        -BootWim $workingBootWim `
+        -BootInfFiles $bootInf
+
+    # -------------------------------------------------------------------------
+    # 6. SWM
+    # -------------------------------------------------------------------------
+    $swmFiles = @(
+        Split-WorkingInstallWim `
+            -InstallWim $workingInstallWim `
+            -DestinationDirectory $OutputRoot |
+        Where-Object { $_ -is [System.IO.FileInfo] }
+    )
+
+    if ($swmFiles.Count -eq 0) {
+        throw 'A divisão do WIM terminou, mas nenhum objeto FileInfo de install*.swm foi retornado.'
+    }
+
+    # -------------------------------------------------------------------------
+    # 7. Espaço e gravação no USB
+    # -------------------------------------------------------------------------
+    Test-UsbCapacityForImages `
+        -UsbRoot $usb `
+        -WorkingBootWim $workingBootWim `
+        -SwmFiles $swmFiles
+
+    Update-UsbImages `
+        -UsbBootWim $usbBootWim `
+        -WorkingBootWim $workingBootWim `
+        -SwmFiles $swmFiles
+
+    Copy-DriverRepositoryToUsbIfPossible -UsbRoot $usb
+
+    # -------------------------------------------------------------------------
+    # 8. Verificação final
+    # -------------------------------------------------------------------------
+    Verify-FinalUsb -UsbRoot $usb
+
+    Write-Step 'PROCESSO CONCLUÍDO'
+
+    Write-Host "Pendrive                    : $usb" -ForegroundColor Green
+    Write-Host "Pacote SCCM Acer            : $AcerSccmPackPath"
+    Write-Host "Drivers extraídos           : $DriverRoot"
+    Write-Host "Backup das imagens originais: $BackupRoot"
+    Write-Host "Logs                         : $LogRoot"
+    Write-Host ''
+    Write-Host 'A mídia do Windows 11 está pronta com os drivers Acer integrados.' `
+        -ForegroundColor Green
+}
+catch {
+    Write-Host ''
+    Write-Host 'ERRO DURANTE O PROCESSO:' -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host ''
+
+    # Só tenta desmontar se houver de fato uma montagem registrada.
+    try {
+        Remove-OurMountedImages
+    }
+    catch {
+        Write-Warning "Falha adicional na limpeza DISM: $($_.Exception.Message)"
+    }
+
+    # Se já começamos a alterar o USB, tenta retornar às imagens originais.
+    Restore-UsbOriginalImages
+
+    Write-Host ''
+    Write-Host "Logs: $LogRoot" -ForegroundColor Yellow
+    Write-Host "Backup: $BackupRoot" -ForegroundColor Yellow
+
+    throw
+}
+finally {
+    if ($script:TranscriptStarted) {
+        Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    }
+}
